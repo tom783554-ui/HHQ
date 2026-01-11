@@ -5,14 +5,18 @@
   <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
   <title>HHQ Hospitals</title>
 
+  <!-- Mapbox GL JS -->
   <script src="https://api.mapbox.com/mapbox-gl-js/v3.17.0/mapbox-gl.js"></script>
   <link href="https://api.mapbox.com/mapbox-gl-js/v3.17.0/mapbox-gl.css" rel="stylesheet" />
+
+  <!-- MapillaryJS -->
   <script src="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.js"></script>
   <link href="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.css" rel="stylesheet" />
 
   <style>
     html, body { margin:0; padding:0; height:100%; width:100%; background:#000; }
     #map { position:absolute; inset:0; }
+
     #reticle {
       position:absolute; left:50%; top:50%;
       transform:translate(-50%,-50%);
@@ -23,17 +27,15 @@
       pointer-events:none;
       z-index:5;
     }
-    #hud {
-      position:absolute; left:10px; top:10px; z-index:50;
-      max-width: 92vw;
-      background: rgba(0,0,0,0.72);
-      color: #fff;
-      border-radius: 12px;
-      padding: 10px 12px;
-      font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      line-height: 1.25;
-      white-space: pre-wrap;
+
+    #toast {
+      position:absolute; left:50%; bottom:18px; transform:translateX(-50%);
+      background:rgba(0,0,0,0.78); color:#fff;
+      padding:10px 12px; border-radius:12px;
+      font:13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      display:none; z-index:20; max-width:86vw; text-align:center;
     }
+
     #viewerOverlay { position:absolute; inset:0; display:none; z-index:10; background:#000; }
     #viewerHeader {
       position:absolute; left:0; right:0; top:0;
@@ -58,7 +60,7 @@
 <body>
   <div id="map"></div>
   <div id="reticle"></div>
-  <div id="hud">Booting…</div>
+  <div id="toast"></div>
 
   <div id="viewerOverlay">
     <div id="viewerHeader">
@@ -69,31 +71,48 @@
   </div>
 
 <script>
+/* =========================
+   TOKENS (embedded)
+   ========================= */
 const MAPBOX_TOKEN = "pk.eyJ1IjoidG9tNzgzNTU0IiwiYSI6ImNtazlwM3FxdzF1cTkzZXB0ZTQzNGZheTIifQ.OdwiqIYdYBn50wbf5VSnsQ";
 const MAPILLARY_TOKEN = "MLY|25982865227984154|a669caf97a22fb6b1a97f2a554777a99";
 
-// IMPORTANT: your repo has hospitals.geojson
-const HOSPITALS_GEOJSON_URL = "./hospitals.geojson";
+/* =========================
+   DATA (bypass GitHub Pages 404)
+   ========================= */
+const HOSPITALS_GEOJSON_URL =
+  "https://raw.githubusercontent.com/tom783554-ui/HHQ/main/hospitals.geojson";
 
+/* =========================
+   UX LOCKS
+   ========================= */
 const AUTO_OPEN = true;
 const MIN_ZOOM_TO_OPEN = 7;
 const OPEN_COOLDOWN_MS = 1600;
 const MAX_QUERY_FEATURES = 12;
+
+// Expanding bbox search radii around hospital point
 const BBOX_RADII = [0.0005, 0.001, 0.002, 0.004, 0.008, 0.015];
 
 let mlyViewer = null;
 let lastOpenedKey = null;
 let lastOpenAt = 0;
 
-const hud = document.getElementById("hud");
-function log(s) { hud.textContent = s; console.log(s); }
-function add(s) { hud.textContent += "\n" + s; console.log(s); }
+function toast(msg, ms=1700) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.style.display = "block";
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.style.display = "none", ms);
+}
 
 function showViewer(title) {
   document.getElementById("viewerTitle").textContent = title || "Street photos";
   document.getElementById("viewerOverlay").style.display = "block";
 }
-function hideViewer() { document.getElementById("viewerOverlay").style.display = "none"; }
+function hideViewer() {
+  document.getElementById("viewerOverlay").style.display = "none";
+}
 document.getElementById("closeBtn").addEventListener("click", hideViewer);
 
 mapboxgl.accessToken = MAPBOX_TOKEN;
@@ -104,75 +123,66 @@ const map = new mapboxgl.Map({
   center: [-98.5795, 39.8283],
   zoom: 3,
   pitch: 0,
-  bearing: 0
+  bearing: 0,
+  attributionControl: true
 });
-
-map.on("error", (e) => {
-  add("Map error: " + (e?.error?.message || e?.type || "unknown"));
-});
-
-async function loadGeoJSON(url) {
-  log("Loading GeoJSON…\n" + url);
-  const res = await fetch(url, { cache: "no-store" });
-  add("GeoJSON HTTP: " + res.status);
-  if (!res.ok) throw new Error("GeoJSON fetch failed: " + res.status);
-  const txt = await res.text();
-  add("GeoJSON bytes: " + txt.length);
-  let obj;
-  try { obj = JSON.parse(txt); } catch { throw new Error("GeoJSON is not valid JSON"); }
-  const n = Array.isArray(obj?.features) ? obj.features.length : 0;
-  add("GeoJSON features: " + n);
-  if (n === 0) throw new Error("GeoJSON has 0 features");
-  return obj;
-}
 
 map.on("load", async () => {
+  // Keep pan/zoom, disable rotation (lighter on iPhone)
   map.dragRotate.disable();
   map.touchZoomRotate.disableRotation();
-  add("Map loaded ✅");
 
+  // Load hospitals
+  let geo;
   try {
-    const geo = await loadGeoJSON(HOSPITALS_GEOJSON_URL);
-
-    map.addSource("hospitals", { type: "geojson", data: geo, generateId: true });
-
-    map.addLayer({
-      id: "hospitals",
-      type: "symbol",
-      source: "hospitals",
-      layout: {
-        "icon-image": "hospital-15",
-        "icon-size": ["interpolate", ["linear"], ["zoom"], 3, 0.7, 6, 0.9, 10, 1.1, 14, 1.3],
-        "icon-allow-overlap": false,
-        "icon-ignore-placement": false,
-        "text-field": ["coalesce", ["get","name"], ["get","NAME"], ""],
-        "text-font": ["Open Sans Semibold", "Arial Unicode MS Bold"],
-        "text-size": ["interpolate", ["linear"], ["zoom"], 7, 0, 9, 11, 12, 13, 15, 15],
-        "text-offset": [0, 1.1],
-        "text-anchor": "top",
-        "text-allow-overlap": false,
-        "text-ignore-placement": false,
-        "text-optional": true
-      },
-      paint: {
-        "text-color": "#ffffff",
-        "text-halo-color": "#000000",
-        "text-halo-width": 1.2,
-        "text-halo-blur": 0.2
-      }
-    });
-
-    add("Hospitals layer added ✅ (zoom in to see labels)");
-
-  } catch (err) {
-    add("❌ " + (err?.message || String(err)));
-    add("Fix: ensure hospitals.geojson exists in repo root and is NOT empty.");
+    const res = await fetch(HOSPITALS_GEOJSON_URL, { cache: "no-store" });
+    if (!res.ok) throw new Error("Hospitals fetch failed: HTTP " + res.status);
+    geo = await res.json();
+    const n = Array.isArray(geo?.features) ? geo.features.length : 0;
+    if (n === 0) throw new Error("Hospitals GeoJSON has 0 features");
+  } catch (e) {
+    console.error(e);
+    toast("Hospitals failed to load. Check hospitals.geojson exists in repo main.");
+    return;
   }
+
+  map.addSource("hospitals", { type: "geojson", data: geo, generateId: true });
+
+  // Decluttered (no-overlap) icons + labels
+  map.addLayer({
+    id: "hospitals",
+    type: "symbol",
+    source: "hospitals",
+    layout: {
+      "icon-image": "hospital-15",
+      "icon-size": ["interpolate", ["linear"], ["zoom"], 3, 0.7, 6, 0.9, 10, 1.1, 14, 1.3],
+      "icon-allow-overlap": false,
+      "icon-ignore-placement": false,
+
+      "text-field": ["coalesce", ["get","name"], ["get","NAME"], ""],
+      "text-font": ["Open Sans Semibold", "Arial Unicode MS Bold"],
+      "text-size": ["interpolate", ["linear"], ["zoom"], 7, 0, 9, 11, 12, 13, 15, 15],
+      "text-offset": [0, 1.1],
+      "text-anchor": "top",
+      "text-allow-overlap": false,
+      "text-ignore-placement": false,
+      "text-optional": true
+    },
+    paint: {
+      "text-color": "#ffffff",
+      "text-halo-color": "#000000",
+      "text-halo-width": 1.2,
+      "text-halo-blur": 0.2
+    }
+  });
+
+  toast("Hospitals loaded.");
 });
 
 async function fetchNearestMapillaryImageId(lat, lon) {
   for (const r of BBOX_RADII) {
     const minLon = lon - r, minLat = lat - r, maxLon = lon + r, maxLat = lat + r;
+
     const url = new URL("https://graph.mapillary.com/images");
     url.searchParams.set("fields", "id");
     url.searchParams.set("bbox", `${minLon},${minLat},${maxLon},${maxLat}`);
@@ -181,6 +191,7 @@ async function fetchNearestMapillaryImageId(lat, lon) {
 
     const res = await fetch(url.toString());
     if (!res.ok) continue;
+
     const json = await res.json();
     const id = json?.data?.[0]?.id;
     if (id) return id;
@@ -218,24 +229,33 @@ async function openForFeature(feature) {
 
   try {
     const imageId = await fetchNearestMapillaryImageId(lat, lon);
-    if (!imageId) { add("No Mapillary near: " + name); hideViewer(); return; }
+    if (!imageId) {
+      toast("No street-level photos near this hospital.");
+      hideViewer();
+      return;
+    }
+
     if (!mlyViewer) {
       mlyViewer = new Mapillary.Viewer({ container: "mly", accessToken: MAPILLARY_TOKEN, imageId });
     } else {
       await mlyViewer.moveTo(imageId);
     }
   } catch (e) {
-    add("Mapillary error: " + (e?.message || e));
+    console.error(e);
+    toast("Street photo load failed (token/coverage/network).");
     hideViewer();
   }
 }
 
+// Auto-open on camera stop (idle)
 map.on("idle", async () => {
   if (!AUTO_OPEN) return;
   if (map.getZoom() < MIN_ZOOM_TO_OPEN) return;
   if (document.getElementById("viewerOverlay").style.display === "block") return;
+
   const f = getCenterHospitalFeature();
   if (!f) return;
+
   await openForFeature(f);
 });
 </script>
